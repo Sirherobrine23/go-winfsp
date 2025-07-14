@@ -7,7 +7,7 @@ import (
 )
 
 func assertEmpty(assert *assert.Assertions, locker *PathLocker) {
-	locker.m.Range(func(k, v interface{}) bool {
+	locker.m.Range(func(k, v any) bool {
 		_ = assert.Failf(
 			"invalid remaining entry %q = %d",
 			k.(string), *v.(*uintptr),

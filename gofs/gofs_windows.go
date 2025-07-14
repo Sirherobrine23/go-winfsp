@@ -12,10 +12,10 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/sys/windows"
 
-	"github.com/aegistudio/go-winfsp"
-	"github.com/aegistudio/go-winfsp/filetime"
-	"github.com/aegistudio/go-winfsp/pathlock"
-	"github.com/aegistudio/go-winfsp/procsd"
+	"github.com/Sirherobrine23/go-winfsp"
+	"github.com/Sirherobrine23/go-winfsp/filetime"
+	"github.com/Sirherobrine23/go-winfsp/pathlock"
+	"github.com/Sirherobrine23/go-winfsp/procsd"
 )
 
 type File interface {

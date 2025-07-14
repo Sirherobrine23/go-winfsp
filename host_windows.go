@@ -4,7 +4,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"sync"
 	"syscall"
@@ -72,8 +71,8 @@ var syscallNTStatusMap = map[syscall.Errno]windows.NTStatus{
 
 	// System errors conversion map.
 	syscall.ERROR_ACCESS_DENIED: windows.STATUS_ACCESS_DENIED,
-	//syscall.ERROR_FILE_NOT_FOUND:  windows.STATUS_OBJECT_NAME_NOT_FOUND,
-	//syscall.ERROR_PATH_NOT_FOUND:  windows.STATUS_OBJECT_NAME_NOT_FOUND,
+	// syscall.ERROR_FILE_NOT_FOUND:  windows.STATUS_OBJECT_NAME_NOT_FOUND,
+	// syscall.ERROR_PATH_NOT_FOUND:  windows.STATUS_OBJECT_NAME_NOT_FOUND,
 	syscall.ERROR_NOT_FOUND:       windows.STATUS_OBJECT_NAME_NOT_FOUND,
 	syscall.ERROR_FILE_EXISTS:     windows.STATUS_OBJECT_NAME_COLLISION,
 	syscall.ERROR_ALREADY_EXISTS:  windows.STATUS_OBJECT_NAME_COLLISION,
@@ -116,12 +115,7 @@ func utf16PtrToString(ptr uintptr) string {
 }
 
 func enforceBytePtr(ptr uintptr, size int) []byte {
-	slice := &reflect.SliceHeader{
-		Data: ptr,
-		Len:  size,
-		Cap:  size,
-	}
-	return *(*[]byte)(unsafe.Pointer(slice))
+	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), size)
 }
 
 // FileSystem is the created object of WinFSP's filesystem.
@@ -140,31 +134,18 @@ type FileSystem struct {
 // upon mounting the filesystem.
 type BehaviourBase interface {
 	// Open the file specified by name.
-	Open(
-		fs *FileSystemRef, name string,
-		createOptions, grantedAccess uint32,
-		info *FSP_FSCTL_FILE_INFO,
-	) (uintptr, error)
+	Open(fs *FileSystemRef, name string, createOptions, grantedAccess uint32, info *FSP_FSCTL_FILE_INFO) (uintptr, error)
 
 	// Close a open file handle.
 	Close(fs *FileSystemRef, file uintptr)
 }
 
-func delegateOpen(
-	fileSystem, fileName uintptr,
-	createOptions, grantedAccess uint32,
-	file *uintptr, fileInfoAddr uintptr,
-) windows.NTStatus {
+func delegateOpen(fileSystem, fileName uintptr, createOptions, grantedAccess uint32, file *uintptr, fileInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	result, err := ref.base.Open(
-		ref, utf16PtrToString(fileName),
-		createOptions, grantedAccess,
-		(*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
-	)
+	result, err := ref.base.Open(ref, utf16PtrToString(fileName), createOptions, grantedAccess, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)))
 	if err != nil {
 		return convertNTStatus(err)
 	}
@@ -172,16 +153,8 @@ func delegateOpen(
 	return windows.STATUS_SUCCESS
 }
 
-var go_delegateOpen = syscall.NewCallbackCDecl(func(
-	fileSystem, fileName uintptr,
-	createOptions, grantedAccess uint32,
-	file *uintptr, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateOpen(
-		fileSystem, fileName,
-		createOptions, grantedAccess,
-		file, fileInfoAddr,
-	))
+var go_delegateOpen = syscall.NewCallbackCDecl(func(fileSystem, fileName uintptr, createOptions, grantedAccess uint32, file *uintptr, fileInfoAddr uintptr) uintptr {
+	return uintptr(delegateOpen(fileSystem, fileName, createOptions, grantedAccess, file, fileInfoAddr))
 })
 
 func delegateClose(fileSystem, file uintptr) {
@@ -192,69 +165,43 @@ func delegateClose(fileSystem, file uintptr) {
 	ref.base.Close(ref, file)
 }
 
-var go_delegateClose = syscall.NewCallbackCDecl(func(
-	fileSystem, file uintptr,
-) uintptr {
+var go_delegateClose = syscall.NewCallbackCDecl(func(fileSystem, file uintptr) uintptr {
 	delegateClose(fileSystem, file)
 	return uintptr(windows.STATUS_SUCCESS)
 })
 
 // BehaviourGetVolumeInfo retrieves volume info.
 type BehaviourGetVolumeInfo interface {
-	GetVolumeInfo(
-		fs *FileSystemRef, info *FSP_FSCTL_VOLUME_INFO,
-	) error
+	GetVolumeInfo(fs *FileSystemRef, info *FSP_FSCTL_VOLUME_INFO) error
 }
 
-func delegateGetVolumeInfo(
-	fileSystem, volumeInfoAddr uintptr,
-) windows.NTStatus {
+func delegateGetVolumeInfo(fileSystem, volumeInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.getVolumeInfo.GetVolumeInfo(
-		ref, (*FSP_FSCTL_VOLUME_INFO)(
-			unsafe.Pointer(volumeInfoAddr)),
-	))
+	return convertNTStatus(ref.getVolumeInfo.GetVolumeInfo(ref, (*FSP_FSCTL_VOLUME_INFO)(unsafe.Pointer(volumeInfoAddr))))
 }
 
-var go_delegateGetVolumeInfo = syscall.NewCallbackCDecl(func(
-	fileSystem, volumeInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateGetVolumeInfo(
-		fileSystem, volumeInfoAddr,
-	))
+var go_delegateGetVolumeInfo = syscall.NewCallbackCDecl(func(fileSystem, volumeInfoAddr uintptr) uintptr {
+	return uintptr(delegateGetVolumeInfo(fileSystem, volumeInfoAddr))
 })
 
 // BehaviourSetVolumeLabel sets volume label.
 type BehaviourSetVolumeLabel interface {
-	SetVolumeLabel(
-		fs *FileSystemRef, label string,
-		info *FSP_FSCTL_VOLUME_INFO,
-	) error
+	SetVolumeLabel(fs *FileSystemRef, label string, info *FSP_FSCTL_VOLUME_INFO) error
 }
 
-func delegateSetVolumeLabel(
-	fileSystem, labelAddr, volumeInfoAddr uintptr,
-) windows.NTStatus {
+func delegateSetVolumeLabel(fileSystem, labelAddr, volumeInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.setVolumeLabel.SetVolumeLabel(
-		ref, utf16PtrToString(labelAddr),
-		(*FSP_FSCTL_VOLUME_INFO)(
-			unsafe.Pointer(volumeInfoAddr)),
-	))
+	return convertNTStatus(ref.setVolumeLabel.SetVolumeLabel(ref, utf16PtrToString(labelAddr), (*FSP_FSCTL_VOLUME_INFO)(unsafe.Pointer(volumeInfoAddr))))
 }
 
-var go_delegateSetVolumeLabel = syscall.NewCallbackCDecl(func(
-	fileSystem, labelAddr, volumeInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateSetVolumeLabel(
-		fileSystem, labelAddr, volumeInfoAddr,
-	))
+var go_delegateSetVolumeLabel = syscall.NewCallbackCDecl(func(fileSystem, labelAddr, volumeInfoAddr uintptr) uintptr {
+	return uintptr(delegateSetVolumeLabel(fileSystem, labelAddr, volumeInfoAddr))
 })
 
 // GetSecurityByNameFlags indicates the content that the
@@ -275,16 +222,10 @@ const (
 // The file attribute can also be a reparse point index when
 // windows.STATUS_REPARSE is returned.
 type BehaviourGetSecurityByName interface {
-	GetSecurityByName(
-		fs *FileSystemRef, name string,
-		flags GetSecurityByNameFlags,
-	) (uint32, *windows.SECURITY_DESCRIPTOR, error)
+	GetSecurityByName(fs *FileSystemRef, name string, flags GetSecurityByNameFlags) (uint32, *windows.SECURITY_DESCRIPTOR, error)
 }
 
-func delegateGetSecurityByName(
-	fileSystem, fileName, attributesAddr uintptr,
-	securityDescAddr, securityDescSizeAddr uintptr,
-) windows.NTStatus {
+func delegateGetSecurityByName(fileSystem, fileName, attributesAddr uintptr, securityDescAddr, securityDescSizeAddr uintptr) windows.NTStatus {
 	flags := GetExistenceOnly
 	attributes := (*uint32)(unsafe.Pointer(attributesAddr))
 	if attributes != nil {
@@ -322,44 +263,21 @@ func delegateGetSecurityByName(
 	return windows.STATUS_SUCCESS
 }
 
-var go_delegateGetSecurityByName = syscall.NewCallbackCDecl(func(
-	fileSystem, fileName, attributesAddr uintptr,
-	securityDescAddr, securityDescSizeAddr uintptr,
-) uintptr {
-	return uintptr(delegateGetSecurityByName(
-		fileSystem, fileName, attributesAddr,
-		securityDescAddr, securityDescSizeAddr,
-	))
+var go_delegateGetSecurityByName = syscall.NewCallbackCDecl(func(fileSystem, fileName, attributesAddr uintptr, securityDescAddr, securityDescSizeAddr uintptr) uintptr {
+	return uintptr(delegateGetSecurityByName(fileSystem, fileName, attributesAddr, securityDescAddr, securityDescSizeAddr))
 })
 
 // BehaviourCreate creates a new file or directory.
 type BehaviourCreate interface {
-	Create(
-		fs *FileSystemRef, name string,
-		createOptions, grantedAccess, fileAttributes uint32,
-		securityDescriptor *windows.SECURITY_DESCRIPTOR,
-		allocationSize uint64, info *FSP_FSCTL_FILE_INFO,
-	) (uintptr, error)
+	Create(fs *FileSystemRef, name string, createOptions, grantedAccess, fileAttributes uint32, securityDescriptor *windows.SECURITY_DESCRIPTOR, allocationSize uint64, info *FSP_FSCTL_FILE_INFO) (uintptr, error)
 }
 
-func delegateCreate(
-	fileSystem, fileName uintptr,
-	createOptions, grantedAccess, fileAttributes uint32,
-	securityDescriptor uintptr, allocationSize uint64,
-	file *uintptr, fileInfoAddr uintptr,
-) windows.NTStatus {
+func delegateCreate(fileSystem, fileName uintptr, createOptions, grantedAccess, fileAttributes uint32, securityDescriptor uintptr, allocationSize uint64, file *uintptr, fileInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	result, err := ref.create.Create(
-		ref, utf16PtrToString(fileName),
-		createOptions, grantedAccess, fileAttributes,
-		(*windows.SECURITY_DESCRIPTOR)(
-			unsafe.Pointer(securityDescriptor)),
-		allocationSize, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
-	)
+	result, err := ref.create.Create(ref, utf16PtrToString(fileName), createOptions, grantedAccess, fileAttributes, (*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(securityDescriptor)), allocationSize, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)))
 	if err != nil {
 		return convertNTStatus(err)
 	}
@@ -367,110 +285,57 @@ func delegateCreate(
 	return windows.STATUS_SUCCESS
 }
 
-var go_delegateCreate = syscall.NewCallbackCDecl(func(
-	fileSystem, fileName uintptr,
-	createOptions, grantedAccess, fileAttributes uint32,
-	securityDescriptor uintptr, allocationSize uint64,
-	file *uintptr, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateCreate(
-		fileSystem, fileName,
-		createOptions, grantedAccess, fileAttributes,
-		securityDescriptor, allocationSize,
-		file, fileInfoAddr,
-	))
+var go_delegateCreate = syscall.NewCallbackCDecl(func(fileSystem, fileName uintptr, createOptions, grantedAccess, fileAttributes uint32, securityDescriptor uintptr, allocationSize uint64, file *uintptr, fileInfoAddr uintptr) uintptr {
+	return uintptr(delegateCreate(fileSystem, fileName, createOptions, grantedAccess, fileAttributes, securityDescriptor, allocationSize, file, fileInfoAddr))
 })
 
 // BehaviourOverwrite overwrites a file's attribute.
 type BehaviourOverwrite interface {
-	Overwrite(
-		fs *FileSystemRef, file uintptr,
-		attributes uint32, replaceAttributes bool,
-		allocationSize uint64,
-		info *FSP_FSCTL_FILE_INFO,
-	) error
+	Overwrite(fs *FileSystemRef, file uintptr, attributes uint32, replaceAttributes bool, allocationSize uint64, info *FSP_FSCTL_FILE_INFO) error
 }
 
-func delegateOverwrite(
-	fileSystem, file uintptr,
-	attributes uint32, replaceAttributes uint8,
-	allocationSize uint64, fileInfoAddr uintptr,
-) windows.NTStatus {
+func delegateOverwrite(fileSystem, file uintptr, attributes uint32, replaceAttributes uint8, allocationSize uint64, fileInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.overwrite.Overwrite(
-		ref, file, attributes, replaceAttributes != 0,
-		allocationSize, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
-	))
+	return convertNTStatus(ref.overwrite.Overwrite(ref, file, attributes, replaceAttributes != 0, allocationSize, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))))
 }
 
-var go_delegateOverwrite = syscall.NewCallbackCDecl(func(
-	fileSystem, file uintptr,
-	attributes uint32, replaceAttributes uint8,
-	allocationSize uint64, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateOverwrite(
-		fileSystem, file,
-		attributes, replaceAttributes,
-		allocationSize, fileInfoAddr,
-	))
+var go_delegateOverwrite = syscall.NewCallbackCDecl(func(fileSystem, file uintptr, attributes uint32, replaceAttributes uint8, allocationSize uint64, fileInfoAddr uintptr) uintptr {
+	return uintptr(delegateOverwrite(fileSystem, file, attributes, replaceAttributes, allocationSize, fileInfoAddr))
 })
 
 // BehaviourCleanup performs the cleanup behaviour.
 type BehaviourCleanup interface {
-	Cleanup(
-		fs *FileSystemRef, file uintptr, name string,
-		cleanupFlags uint32,
-	)
+	Cleanup(fs *FileSystemRef, file uintptr, name string, cleanupFlags uint32)
 }
 
-func delegateCleanup(
-	fileSystem, fileContext, filename uintptr,
-	cleanupFlags uint32,
-) {
+func delegateCleanup(fileSystem, fileContext, filename uintptr, cleanupFlags uint32) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return
 	}
-	ref.cleanup.Cleanup(
-		ref, fileContext, utf16PtrToString(filename),
-		cleanupFlags,
-	)
+	ref.cleanup.Cleanup(ref, fileContext, utf16PtrToString(filename), cleanupFlags)
 }
 
-var go_delegateCleanup = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, filename uintptr,
-	cleanupFlags uint32,
-) uintptr {
-	delegateCleanup(
-		fileSystem, fileContext, filename,
-		cleanupFlags,
-	)
+var go_delegateCleanup = syscall.NewCallbackCDecl(func(fileSystem, fileContext, filename uintptr, cleanupFlags uint32) uintptr {
+	delegateCleanup(fileSystem, fileContext, filename, cleanupFlags)
 	return uintptr(windows.STATUS_SUCCESS)
 })
 
 // BehaviourRead read an open file.
 type BehaviourRead interface {
-	Read(
-		fs *FileSystemRef, file uintptr,
-		buf []byte, offset uint64,
-	) (int, error)
+	Read(fs *FileSystemRef, file uintptr, buf []byte, offset uint64) (int, error)
 }
 
-func delegateRead(
-	fileSystem, fileContext, buffer uintptr,
-	offset uint64, length uint32, bytesRead *uint32,
-) windows.NTStatus {
+func delegateRead(fileSystem, fileContext, buffer uintptr, offset uint64, length uint32, bytesRead *uint32) windows.NTStatus {
 	*bytesRead = 0
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	n, err := ref.read.Read(ref, fileContext,
-		enforceBytePtr(buffer, int(length)), offset)
+	n, err := ref.read.Read(ref, fileContext, enforceBytePtr(buffer, int(length)), offset)
 	*bytesRead = uint32(n)
 	// XXX: this is required otherwise windows kernel render
 	// it as nothing read from the file instead.
@@ -480,59 +345,28 @@ func delegateRead(
 	return convertNTStatus(err)
 }
 
-var go_delegateRead = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, buffer uintptr,
-	offset uint64, length uint32, bytesRead *uint32,
-) uintptr {
-	return uintptr(delegateRead(
-		fileSystem, fileContext, buffer,
-		offset, length, bytesRead,
-	))
+var go_delegateRead = syscall.NewCallbackCDecl(func(fileSystem, fileContext, buffer uintptr, offset uint64, length uint32, bytesRead *uint32) uintptr {
+	return uintptr(delegateRead(fileSystem, fileContext, buffer, offset, length, bytesRead))
 })
 
 // BehaviourWrite writes an open file.
 type BehaviourWrite interface {
-	Write(
-		fs *FileSystemRef, file uintptr,
-		buf []byte, offset uint64,
-		writeToEndOfFile, constrainedIo bool,
-		info *FSP_FSCTL_FILE_INFO,
-	) (int, error)
+	Write(fs *FileSystemRef, file uintptr, buf []byte, offset uint64, writeToEndOfFile, constrainedIo bool, info *FSP_FSCTL_FILE_INFO) (int, error)
 }
 
-func delegateWrite(
-	fileSystem, fileContext, buffer uintptr,
-	offset uint64, length uint32,
-	writeToEndOfFile, constrainedIo uint8,
-	bytesWritten *uint32, fileInfoAddr uintptr,
-) windows.NTStatus {
+func delegateWrite(fileSystem, fileContext, buffer uintptr, offset uint64, length uint32, writeToEndOfFile, constrainedIo uint8, bytesWritten *uint32, fileInfoAddr uintptr) windows.NTStatus {
 	*bytesWritten = 0
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	n, err := ref.write.Write(ref, fileContext,
-		enforceBytePtr(buffer, int(length)), offset,
-		writeToEndOfFile != 0, constrainedIo != 0,
-		(*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
-	)
+	n, err := ref.write.Write(ref, fileContext, enforceBytePtr(buffer, int(length)), offset, writeToEndOfFile != 0, constrainedIo != 0, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)))
 	*bytesWritten = uint32(n)
 	return convertNTStatus(err)
 }
 
-var go_delegateWrite = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, buffer uintptr,
-	offset uint64, length uint32,
-	writeToEndOfFile, constrainedIo uint8,
-	bytesWritten *uint32, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateWrite(
-		fileSystem, fileContext, buffer,
-		offset, length,
-		writeToEndOfFile, constrainedIo,
-		bytesWritten, fileInfoAddr,
-	))
+var go_delegateWrite = syscall.NewCallbackCDecl(func(fileSystem, fileContext, buffer uintptr, offset uint64, length uint32, writeToEndOfFile, constrainedIo uint8, bytesWritten *uint32, fileInfoAddr uintptr) uintptr {
+	return uintptr(delegateWrite(fileSystem, fileContext, buffer, offset, length, writeToEndOfFile, constrainedIo, bytesWritten, fileInfoAddr))
 })
 
 // BehaviourFlush flushes a file or volume.
@@ -540,60 +374,36 @@ var go_delegateWrite = syscall.NewCallbackCDecl(func(
 // When file is not NULL, the specific file will be flushed,
 // otherwise the whole volume will be flushed.
 type BehaviourFlush interface {
-	Flush(
-		fs *FileSystemRef, file uintptr,
-		info *FSP_FSCTL_FILE_INFO,
-	) error
+	Flush(fs *FileSystemRef, file uintptr, info *FSP_FSCTL_FILE_INFO) error
 }
 
-func delegateFlush(
-	fileSystem, fileContext, infoAddr uintptr,
-) windows.NTStatus {
+func delegateFlush(fileSystem, fileContext, infoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.flush.Flush(
-		ref, fileContext, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(infoAddr)),
-	))
+	return convertNTStatus(ref.flush.Flush(ref, fileContext, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(infoAddr))))
 }
 
-var go_delegateFlush = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, infoAddr uintptr,
-) uintptr {
-	return uintptr(delegateFlush(
-		fileSystem, fileContext, infoAddr,
-	))
+var go_delegateFlush = syscall.NewCallbackCDecl(func(fileSystem, fileContext, infoAddr uintptr) uintptr {
+	return uintptr(delegateFlush(fileSystem, fileContext, infoAddr))
 })
 
 // BehaviourGetFileInfo retrieves stat of file or directory.
 type BehaviourGetFileInfo interface {
-	GetFileInfo(
-		fs *FileSystemRef, file uintptr,
-		info *FSP_FSCTL_FILE_INFO,
-	) error
+	GetFileInfo(fs *FileSystemRef, file uintptr, info *FSP_FSCTL_FILE_INFO) error
 }
 
-func delegateGetFileInfo(
-	fileSystem, fileContext, infoAddr uintptr,
-) windows.NTStatus {
+func delegateGetFileInfo(fileSystem, fileContext, infoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.getFileInfo.GetFileInfo(
-		ref, fileContext, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(infoAddr)),
-	))
+	return convertNTStatus(ref.getFileInfo.GetFileInfo(ref, fileContext, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(infoAddr))))
 }
 
-var go_delegateGetFileInfo = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, infoAddr uintptr,
-) uintptr {
-	return uintptr(delegateGetFileInfo(
-		fileSystem, fileContext, infoAddr,
-	))
+var go_delegateGetFileInfo = syscall.NewCallbackCDecl(func(fileSystem, fileContext, infoAddr uintptr) uintptr {
+	return uintptr(delegateGetFileInfo(fileSystem, fileContext, infoAddr))
 })
 
 // SetBasicInfoFlags specifies a set of modified values
@@ -610,20 +420,10 @@ const (
 
 // BehaviourSetBasicInfo sets stat of file or directory.
 type BehaviourSetBasicInfo interface {
-	SetBasicInfo(
-		fs *FileSystemRef, file uintptr,
-		flags SetBasicInfoFlags, attributes uint32,
-		creationTime, lastAccessTime, lastWriteTime, changeTime uint64,
-		fileInfo *FSP_FSCTL_FILE_INFO,
-	) error
+	SetBasicInfo(fs *FileSystemRef, file uintptr, flags SetBasicInfoFlags, attributes uint32, creationTime, lastAccessTime, lastWriteTime, changeTime uint64, fileInfo *FSP_FSCTL_FILE_INFO) error
 }
 
-func delegateSetBasicInfo(
-	fileSystem, fileContext uintptr,
-	attributes uint32,
-	creationTime, lastAccessTime, lastWriteTime, changeTime uint64,
-	fileInfoAddr uintptr,
-) windows.NTStatus {
+func delegateSetBasicInfo(fileSystem, fileContext uintptr, attributes uint32, creationTime, lastAccessTime, lastWriteTime, changeTime uint64, fileInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
@@ -644,133 +444,70 @@ func delegateSetBasicInfo(
 	if changeTime != 0 {
 		flags |= SetBasicInfoChangeTime
 	}
-	return convertNTStatus(ref.setBasicInfo.SetBasicInfo(
-		ref, fileContext, flags, attributes,
-		creationTime, lastAccessTime, lastWriteTime, changeTime,
-		(*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)),
-	))
+	return convertNTStatus(ref.setBasicInfo.SetBasicInfo(ref, fileContext, flags, attributes, creationTime, lastAccessTime, lastWriteTime, changeTime, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))))
 }
 
-var go_delegateSetBasicInfo = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	attributes uint32,
-	creationTime, lastAccessTime, lastWriteTime, changeTime uint64,
-	fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateSetBasicInfo(
-		fileSystem, fileContext, attributes,
-		creationTime, lastAccessTime, lastWriteTime, changeTime,
-		fileInfoAddr,
-	))
+var go_delegateSetBasicInfo = syscall.NewCallbackCDecl(func(fileSystem, fileContext uintptr, attributes uint32, creationTime, lastAccessTime, lastWriteTime, changeTime uint64, fileInfoAddr uintptr) uintptr {
+	return uintptr(delegateSetBasicInfo(fileSystem, fileContext, attributes, creationTime, lastAccessTime, lastWriteTime, changeTime, fileInfoAddr))
 })
 
 // BehaviourSetFileSize sets file's size or allocation size.
 type BehaviourSetFileSize interface {
-	SetFileSize(
-		fs *FileSystemRef, file uintptr,
-		newSize uint64, setAllocationSize bool,
-		fileInfo *FSP_FSCTL_FILE_INFO,
-	) error
+	SetFileSize(fs *FileSystemRef, file uintptr, newSize uint64, setAllocationSize bool, fileInfo *FSP_FSCTL_FILE_INFO) error
 }
 
-func delegateSetFileSize(
-	fileSystem, fileContext uintptr,
-	newSize uint64, setAllocationSize uint8,
-	fileInfoAddr uintptr,
-) windows.NTStatus {
+func delegateSetFileSize(fileSystem, fileContext uintptr, newSize uint64, setAllocationSize uint8, fileInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.setFileSize.SetFileSize(
-		ref, fileContext, newSize, setAllocationSize != 0,
-		(*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)),
-	))
+	return convertNTStatus(ref.setFileSize.SetFileSize(ref, fileContext, newSize, setAllocationSize != 0, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))))
 }
 
-var go_delegateSetFileSize = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	newSize uint64, setAllocationSize uint8,
-	fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateSetFileSize(
-		fileSystem, fileContext,
-		newSize, setAllocationSize,
-		fileInfoAddr,
-	))
+var go_delegateSetFileSize = syscall.NewCallbackCDecl(func(fileSystem, fileContext uintptr, newSize uint64, setAllocationSize uint8, fileInfoAddr uintptr) uintptr {
+	return uintptr(delegateSetFileSize(fileSystem, fileContext, newSize, setAllocationSize, fileInfoAddr))
 })
 
 // BehaviourCanDelete detects whether the file can be deleted.
 type BehaviourCanDelete interface {
-	CanDelete(
-		fs *FileSystemRef, file uintptr, name string,
-	) error
+	CanDelete(fs *FileSystemRef, file uintptr, name string) error
 }
 
-func delegateCanDelete(
-	fileSystem, fileContext, filename uintptr,
-) windows.NTStatus {
+func delegateCanDelete(fileSystem, fileContext, filename uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.canDelete.CanDelete(
-		ref, fileContext, utf16PtrToString(filename),
-	))
+	return convertNTStatus(ref.canDelete.CanDelete(ref, fileContext, utf16PtrToString(filename)))
 }
 
-var go_delegateCanDelete = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, filename uintptr,
-) uintptr {
-	return uintptr(delegateCanDelete(
-		fileSystem, fileContext, filename,
-	))
+var go_delegateCanDelete = syscall.NewCallbackCDecl(func(fileSystem, fileContext, filename uintptr) uintptr {
+	return uintptr(delegateCanDelete(fileSystem, fileContext, filename))
 })
 
 // BehaviourRename renames a file or directory.
 type BehaviourRename interface {
-	Rename(
-		fs *FileSystemRef, file uintptr,
-		source, target string, replaceIfExist bool,
-	) error
+	Rename(fs *FileSystemRef, file uintptr, source, target string, replaceIfExist bool) error
 }
 
-func delegateRename(
-	fileSystem, fileContext uintptr,
-	source, target uintptr, replaceIfExists uint8,
-) windows.NTStatus {
+func delegateRename(fileSystem, fileContext uintptr, source, target uintptr, replaceIfExists uint8) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.rename.Rename(
-		ref, fileContext,
-		utf16PtrToString(source), utf16PtrToString(target),
-		replaceIfExists != 0,
-	))
+	return convertNTStatus(ref.rename.Rename(ref, fileContext, utf16PtrToString(source), utf16PtrToString(target), replaceIfExists != 0))
 }
 
-var go_delegateRename = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	source, target uintptr, replaceIfExists uint8,
-) uintptr {
-	return uintptr(delegateRename(
-		fileSystem, fileContext,
-		source, target, replaceIfExists,
-	))
+var go_delegateRename = syscall.NewCallbackCDecl(func(fileSystem, fileContext uintptr, source, target uintptr, replaceIfExists uint8) uintptr {
+	return uintptr(delegateRename(fileSystem, fileContext, source, target, replaceIfExists))
 })
 
 // BehaviourGetSecurity retrieves security descriptor by file.
 type BehaviourGetSecurity interface {
-	GetSecurity(
-		fs *FileSystemRef, file uintptr,
-	) (*windows.SECURITY_DESCRIPTOR, error)
+	GetSecurity(fs *FileSystemRef, file uintptr) (*windows.SECURITY_DESCRIPTOR, error)
 }
 
-func delegateGetSecurity(
-	fileSystem, fileContext uintptr,
-	securityDescAddr, securityDescSizeAddr uintptr,
-) windows.NTStatus {
+func delegateGetSecurity(fileSystem, fileContext uintptr, securityDescAddr, securityDescSizeAddr uintptr) windows.NTStatus {
 	size := (*uintptr)(unsafe.Pointer(securityDescSizeAddr))
 	var bufferSize int
 	if size != nil {
@@ -800,47 +537,25 @@ func delegateGetSecurity(
 	return windows.STATUS_SUCCESS
 }
 
-var go_delegateGetSecurity = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	securityDescAddr, securityDescSizeAddr uintptr,
-) uintptr {
-	return uintptr(delegateGetSecurity(
-		fileSystem, fileContext,
-		securityDescAddr, securityDescSizeAddr,
-	))
+var go_delegateGetSecurity = syscall.NewCallbackCDecl(func(fileSystem, fileContext uintptr, securityDescAddr, securityDescSizeAddr uintptr) uintptr {
+	return uintptr(delegateGetSecurity(fileSystem, fileContext, securityDescAddr, securityDescSizeAddr))
 })
 
 // BehaviourSetSecurity sets security descriptor by file.
 type BehaviourSetSecurity interface {
-	SetSecurity(
-		fs *FileSystemRef, file uintptr,
-		info windows.SECURITY_INFORMATION,
-		desc *windows.SECURITY_DESCRIPTOR,
-	) error
+	SetSecurity(fs *FileSystemRef, file uintptr, info windows.SECURITY_INFORMATION, desc *windows.SECURITY_DESCRIPTOR) error
 }
 
-func delegateSetSecurity(
-	fileSystem, fileContext uintptr,
-	info windows.SECURITY_INFORMATION, securityDescSizeAddr uintptr,
-) windows.NTStatus {
+func delegateSetSecurity(fileSystem, fileContext uintptr, info windows.SECURITY_INFORMATION, securityDescSizeAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.setSecurity.SetSecurity(
-		ref, fileContext, info,
-		(*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(
-			securityDescSizeAddr))))
+	return convertNTStatus(ref.setSecurity.SetSecurity(ref, fileContext, info, (*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(securityDescSizeAddr))))
 }
 
-var go_delegateSetSecurity = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	info windows.SECURITY_INFORMATION, securityDescSizeAddr uintptr,
-) uintptr {
-	return uintptr(delegateSetSecurity(
-		fileSystem, fileContext,
-		info, securityDescSizeAddr,
-	))
+var go_delegateSetSecurity = syscall.NewCallbackCDecl(func(fileSystem, fileContext uintptr, info windows.SECURITY_INFORMATION, securityDescSizeAddr uintptr) uintptr {
+	return uintptr(delegateSetSecurity(fileSystem, fileContext, info, securityDescSizeAddr))
 })
 
 var (
@@ -863,21 +578,19 @@ type DirBuffer struct {
 
 // Delete the directory buffer.
 func (buf *DirBuffer) Delete() {
-	_, _, _ = deleteDirectoryBuffer.Call(
-		uintptr(unsafe.Pointer(&buf.ptr)))
+	_, _, _ = deleteDirectoryBuffer.Call(uintptr(unsafe.Pointer(&buf.ptr)))
 }
 
 // ReadDirectory fills the read content into the buffer when
 // there's no content remaining.
-func (buf *DirBuffer) ReadDirectory(
-	marker *uint16, buffer []byte,
-) int {
+func (buf *DirBuffer) ReadDirectory(marker *uint16, buffer []byte) int {
 	var bytesTransferred uint32
-	slice := (*reflect.SliceHeader)(unsafe.Pointer(&buffer))
+	// slice := (*reflect.SliceHeader)(unsafe.Pointer(&buffer))
 	_, _, _ = readDirectoryBuffer.Call(
 		uintptr(unsafe.Pointer(&buf.ptr)),
 		uintptr(unsafe.Pointer(marker)),
-		slice.Data, uintptr(slice.Len),
+		// slice.Data, uintptr(slice.Len),
+		uintptr(unsafe.Pointer(unsafe.SliceData(buffer))), uintptr(len(buffer)),
 		uintptr(unsafe.Pointer(&bytesTransferred)),
 	)
 	return int(bytesTransferred)
@@ -923,9 +636,7 @@ func (buf *DirBuffer) Acquire(reset bool) (*DirBufferFiller, error) {
 // The iteration might also be stopped when the caller
 // returns false, in thise case we should also terminate
 // the iteration and copy the content out to the handler.
-func (b *DirBufferFiller) Fill(
-	name string, fileInfo *FSP_FSCTL_FILE_INFO,
-) (bool, error) {
+func (b *DirBufferFiller) Fill(name string, fileInfo *FSP_FSCTL_FILE_INFO) (bool, error) {
 	utf16, err := windows.UTF16FromString(name)
 	if err != nil {
 		return false, err
@@ -935,8 +646,7 @@ func (b *DirBufferFiller) Fill(
 		// while copying to the directory buffer.
 		utf16 = utf16[:len(utf16)-1]
 	}
-	length := int(unsafe.Sizeof(FSP_FSCTL_DIR_INFO{}) +
-		uintptr(len(utf16))*SIZEOF_WCHAR)
+	length := int(unsafe.Sizeof(FSP_FSCTL_DIR_INFO{}) + uintptr(len(utf16))*SIZEOF_WCHAR)
 	alignedBuffer := make([]uint64, (length+7)/8)
 	alignedAddr := uintptr(unsafe.Pointer(&alignedBuffer[0]))
 	dirInfo := (*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(alignedAddr))
@@ -944,17 +654,16 @@ func (b *DirBufferFiller) Fill(
 	if fileInfo != nil {
 		dirInfo.FileInfo = *fileInfo
 	}
-	target := *((*[]uint16)(unsafe.Pointer(&reflect.SliceHeader{
-		Data: alignedAddr + unsafe.Sizeof(FSP_FSCTL_DIR_INFO{}),
-		Len:  len(utf16),
-		Cap:  len(utf16),
-	})))
+	// target := *((*[]uint16)(unsafe.Pointer(&reflect.SliceHeader{
+	// 	Data: alignedAddr + unsafe.Sizeof(FSP_FSCTL_DIR_INFO{}),
+	// 	Len:  len(utf16),
+	// 	Cap:  len(utf16),
+	// })))
+
+	target := unsafe.Slice((*uint16)(unsafe.Pointer(alignedAddr+unsafe.Sizeof(FSP_FSCTL_DIR_INFO{}))), len(utf16))
 	copy(target, utf16)
 	var status windows.NTStatus
-	copyOk, _, _ := fillDirectoryBuffer.Call(
-		uintptr(unsafe.Pointer(&b.buf.ptr)), alignedAddr,
-		uintptr(unsafe.Pointer(&status)),
-	)
+	copyOk, _, _ := fillDirectoryBuffer.Call(uintptr(unsafe.Pointer(&b.buf.ptr)), alignedAddr, uintptr(unsafe.Pointer(&status)))
 	if status != windows.STATUS_SUCCESS {
 		err = status
 	}
@@ -965,8 +674,7 @@ func (b *DirBufferFiller) Fill(
 
 // Release the directory buffer filler.
 func (b *DirBufferFiller) Release() {
-	_, _, _ = releaseDirectoryBuffer.Call(
-		uintptr(unsafe.Pointer(&b.buf.ptr)))
+	_, _, _ = releaseDirectoryBuffer.Call(uintptr(unsafe.Pointer(&b.buf.ptr)))
 }
 
 // BehaviourReadDirectoryRaw is the raw interface of read
@@ -976,38 +684,21 @@ func (b *DirBufferFiller) Release() {
 // For performance issue, the pattern and marker are not
 // translated into go string.
 type BehaviourReadDirectoryRaw interface {
-	ReadDirectoryRaw(
-		fs *FileSystemRef, file uintptr,
-		pattern, marker *uint16, buf []byte,
-	) (int, error)
+	ReadDirectoryRaw(fs *FileSystemRef, file uintptr, pattern, marker *uint16, buf []byte) (int, error)
 }
 
-func delegateReadDirectory(
-	fileSystem, fileContext uintptr,
-	pattern, marker *uint16,
-	buf uintptr, length uint32, numRead *uint32,
-) windows.NTStatus {
+func delegateReadDirectory(fileSystem, fileContext uintptr, pattern, marker *uint16, buf uintptr, length uint32, numRead *uint32) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	n, err := ref.readDirRaw.ReadDirectoryRaw(
-		ref, fileContext, pattern, marker,
-		enforceBytePtr(buf, int(length)))
+	n, err := ref.readDirRaw.ReadDirectoryRaw(ref, fileContext, pattern, marker, enforceBytePtr(buf, int(length)))
 	*numRead = uint32(n)
 	return convertNTStatus(err)
 }
 
-var go_delegateReadDirectory = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	pattern, marker *uint16,
-	buf uintptr, length uint32, numRead *uint32,
-) uintptr {
-	return uintptr(delegateReadDirectory(
-		fileSystem, fileContext,
-		pattern, marker,
-		buf, length, numRead,
-	))
+var go_delegateReadDirectory = syscall.NewCallbackCDecl(func(fileSystem, fileContext uintptr, pattern, marker *uint16, buf uintptr, length uint32, numRead *uint32) uintptr {
+	return uintptr(delegateReadDirectory(fileSystem, fileContext, pattern, marker, buf, length, numRead))
 })
 
 // BehaviourReadDirectory is the delegated interface which
@@ -1019,24 +710,16 @@ var go_delegateReadDirectory = syscall.NewCallbackCDecl(func(
 // destroyed manually when the BehaviourBase.Close method
 // has been called.
 type BehaviourReadDirectory interface {
-	GetOrNewDirBuffer(
-		fileSystem *FileSystemRef, file uintptr,
-	) (*DirBuffer, error)
+	GetOrNewDirBuffer(fileSystem *FileSystemRef, file uintptr) (*DirBuffer, error)
 
-	ReadDirectory(
-		fs *FileSystemRef, file uintptr, pattern string,
-		fill func(string, *FSP_FSCTL_FILE_INFO) (bool, error),
-	) error
+	ReadDirectory(fs *FileSystemRef, file uintptr, pattern string, fill func(string, *FSP_FSCTL_FILE_INFO) (bool, error)) error
 }
 
 type behaviourReadDirectoryDelegate struct {
 	readDir BehaviourReadDirectory
 }
 
-func (d *behaviourReadDirectoryDelegate) ReadDirectoryRaw(
-	fs *FileSystemRef, file uintptr,
-	pattern, marker *uint16, buf []byte,
-) (int, error) {
+func (d *behaviourReadDirectoryDelegate) ReadDirectoryRaw(fs *FileSystemRef, file uintptr, pattern, marker *uint16, buf []byte) (int, error) {
 	// XXX: This is literally identital to the WinFsp-Tutorial.
 	// https://github.com/winfsp/winfsp/wiki/WinFsp-Tutorial#readdirectory
 	dirBuf, err := d.readDir.GetOrNewDirBuffer(fs, file)
@@ -1066,34 +749,19 @@ func (d *behaviourReadDirectoryDelegate) ReadDirectoryRaw(
 // BehaviourGetDirInfoByName get directory information for a
 // file or directory within a parent directory.
 type BehaviourGetDirInfoByName interface {
-	GetDirInfoByName(
-		fs *FileSystemRef, parentDirFile uintptr,
-		name string, dirInfo *FSP_FSCTL_DIR_INFO,
-	) error
+	GetDirInfoByName(fs *FileSystemRef, parentDirFile uintptr, name string, dirInfo *FSP_FSCTL_DIR_INFO) error
 }
 
-func delegateGetDirInfoByName(
-	fileSystem, parentDirFile uintptr,
-	fileName, dirInfoAddr uintptr,
-) windows.NTStatus {
+func delegateGetDirInfoByName(fileSystem, parentDirFile uintptr, fileName, dirInfoAddr uintptr) windows.NTStatus {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.getDirInfoByName.GetDirInfoByName(
-		ref, parentDirFile, utf16PtrToString(fileName),
-		(*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(dirInfoAddr)),
-	))
+	return convertNTStatus(ref.getDirInfoByName.GetDirInfoByName(ref, parentDirFile, utf16PtrToString(fileName), (*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(dirInfoAddr))))
 }
 
-var go_delegateGetDirInfoByName = syscall.NewCallbackCDecl(func(
-	fileSystem, parentDirFile uintptr,
-	fileName, dirInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateGetDirInfoByName(
-		fileSystem, parentDirFile,
-		fileName, dirInfoAddr,
-	))
+var go_delegateGetDirInfoByName = syscall.NewCallbackCDecl(func(fileSystem, parentDirFile uintptr, fileName, dirInfoAddr uintptr) uintptr {
+	return uintptr(delegateGetDirInfoByName(fileSystem, parentDirFile, fileName, dirInfoAddr))
 })
 
 // BehaviourDeviceIoControl processes control code.
@@ -1183,23 +851,17 @@ func delegateCreateEx(
 			return ref.createEx.CreateExWithReparsePointData(
 				ref, utf16PtrToString(fileName),
 				createOptions, grantedAccess, fileAttributes,
-				(*windows.SECURITY_DESCRIPTOR)(
-					unsafe.Pointer(securityDescriptor)),
-				(*REPARSE_DATA_BUFFER_GENERIC)(
-					unsafe.Pointer(extraBuffer)),
-				allocationSize, (*FSP_FSCTL_FILE_INFO)(
-					unsafe.Pointer(fileInfoAddr)),
+				(*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(securityDescriptor)),
+				(*REPARSE_DATA_BUFFER_GENERIC)(unsafe.Pointer(extraBuffer)),
+				allocationSize, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)),
 			)
 		} else {
 			return ref.createEx.CreateExWithExtendedAttribute(
 				ref, utf16PtrToString(fileName),
 				createOptions, grantedAccess, fileAttributes,
-				(*windows.SECURITY_DESCRIPTOR)(
-					unsafe.Pointer(securityDescriptor)),
-				(*FILE_FULL_EA_INFORMATION)(
-					unsafe.Pointer(extraBuffer)),
-				allocationSize, (*FSP_FSCTL_FILE_INFO)(
-					unsafe.Pointer(fileInfoAddr)),
+				(*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(securityDescriptor)),
+				(*FILE_FULL_EA_INFORMATION)(unsafe.Pointer(extraBuffer)),
+				allocationSize, (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)),
 			)
 		}
 	}()
@@ -1316,13 +978,10 @@ var (
 
 // Mount attempts to mount a file system to specified mount
 // point, returning the handle to the real filesystem.
-func Mount(
-	fs BehaviourBase, mountpoint string, opts ...Option,
-) (*FileSystem, error) {
+func Mount(fs BehaviourBase, mountpoint string, opts ...Option) (*FileSystem, error) {
 	if fs == nil {
 		return nil, errors.New("invalid nil fs parameter")
-	}
-	if err := tryLoadWinFSP(); err != nil {
+	} else if err := LoadWinFSP(); err != nil {
 		return nil, err
 	}
 	option := newOption()
@@ -1474,15 +1133,12 @@ func Mount(
 
 	// Convert and file the volume parameters for mounting.
 	volumeParams := &FSP_FSCTL_VOLUME_PARAMS_V1{}
-	sizeOfVolumeParamsV1 := uint16(unsafe.Sizeof(
-		FSP_FSCTL_VOLUME_PARAMS_V1{}))
+	sizeOfVolumeParamsV1 := uint16(unsafe.Sizeof(FSP_FSCTL_VOLUME_PARAMS_V1{}))
 	volumeParams.SizeOfVolumeParamsV1 = sizeOfVolumeParamsV1
 	volumeParams.SectorSize = 1
 	volumeParams.SectorsPerAllocationUnit = 4096
-	nowFiletime := syscall.NsecToFiletime(
-		option.creationTime.UnixNano())
-	volumeParams.VolumeCreationTime =
-		*(*uint64)(unsafe.Pointer(&nowFiletime))
+	nowFiletime := syscall.NsecToFiletime(option.creationTime.UnixNano())
+	volumeParams.VolumeCreationTime = *(*uint64)(unsafe.Pointer(&nowFiletime))
 	volumeParams.FileSystemAttribute = attributes
 	copy(volumeParams.Prefix[:], utf16Prefix)
 	copy(volumeParams.FileSystemName[:], utf16Name)
@@ -1507,17 +1163,13 @@ func Mount(
 	}
 	defer func() {
 		if !created {
-			_, _, _ = fileSystemDelete.Call(
-				uintptr(unsafe.Pointer(result.fileSystem)))
+			_, _, _ = fileSystemDelete.Call(uintptr(unsafe.Pointer(result.fileSystem)))
 		}
 	}()
 	result.fileSystem.UserContext = fileSystemAddr
 
 	// Attempt to mount the file system at mount point.
-	mountResult, _, err := setMountPoint.Call(
-		uintptr(unsafe.Pointer(result.fileSystem)),
-		uintptr(unsafe.Pointer(utf16MountPoint)),
-	)
+	mountResult, _, err := setMountPoint.Call(uintptr(unsafe.Pointer(result.fileSystem)), uintptr(unsafe.Pointer(utf16MountPoint)))
 	runtime.KeepAlive(utf16MountPoint)
 	mountStatus := windows.NTStatus(mountResult)
 	if err == syscall.Errno(0) {
@@ -1531,9 +1183,7 @@ func Mount(
 	}
 
 	// Attempt to start the file system dispatcher.
-	startResult, _, err := startDispatcher.Call(
-		uintptr(unsafe.Pointer(result.fileSystem)), uintptr(0),
-	)
+	startResult, _, err := startDispatcher.Call(uintptr(unsafe.Pointer(result.fileSystem)), uintptr(0))
 	startStatus := windows.NTStatus(startResult)
 	if err == syscall.Errno(0) {
 		err = nil
@@ -1546,8 +1196,7 @@ func Mount(
 	}
 	defer func() {
 		if !created {
-			_, _, _ = stopDispatcher.Call(
-				uintptr(unsafe.Pointer(result.fileSystem)))
+			_, _, _ = stopDispatcher.Call(uintptr(unsafe.Pointer(result.fileSystem)))
 		}
 	}()
 	created = true
@@ -1564,21 +1213,20 @@ func (f *FileSystem) Unmount() {
 // loadWinFSPDLL attempts to locate and load the DLL, the
 // library handle will be available from now on.
 func loadWinFSPDLL() (*syscall.DLL, error) {
-	dllName := ""
+	var dllName string
 	switch runtime.GOARCH {
-	case "arm64":
-		dllName = "winfsp-a64.dll"
 	case "amd64":
 		dllName = "winfsp-x64.dll"
+	case "arm64":
+		dllName = "winfsp-a64.dll"
 	case "386":
 		dllName = "winfsp-x86.dll"
-	}
-	if dllName == "" {
+	default:
 		// Current platform does not have winfsp shipped
 		// with it, and we can only report the error.
-		return nil, errors.Errorf(
-			"winfsp unsupported arch %q", runtime.GOARCH)
+		return nil, errors.Errorf("winfsp unsupported arch %q", runtime.GOARCH)
 	}
+
 	dll, _ := syscall.LoadDLL(dllName)
 	if dll != nil {
 		return dll, nil
@@ -1624,63 +1272,43 @@ func loadWinFSPDLL() (*syscall.DLL, error) {
 	installPath := syscall.UTF16ToString(path)
 
 	// Attempt to load the DLL that we have found.
-	return syscall.LoadDLL(filepath.Join(
-		installPath, "bin", dllName))
+	return syscall.LoadDLL(filepath.Join(installPath, "bin", dllName))
 }
 
 var (
-	winFSPDLL *syscall.DLL
-)
-
-func findProc(name string, target **syscall.Proc) error {
-	proc, err := winFSPDLL.FindProc(name)
-	if err != nil {
-		return errors.Wrapf(err,
-			"winfsp cannot find proc %q", name)
-	}
-	*target = proc
-	return nil
-}
-
-func loadProcs(procs map[string]**syscall.Proc) error {
-	for name, proc := range procs {
-		if err := findProc(name, proc); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func initWinFSP() error {
-	dll, err := loadWinFSPDLL()
-	if err != nil {
-		return err
-	}
-	winFSPDLL = dll
-	return loadProcs(map[string]**syscall.Proc{
-		"FspFileSystemDeleteDirectoryBuffer":  &deleteDirectoryBuffer,
-		"FspFileSystemAcquireDirectoryBuffer": &acquireDirectoryBuffer,
-		"FspFileSystemReleaseDirectoryBuffer": &releaseDirectoryBuffer,
-		"FspFileSystemReadDirectoryBuffer":    &readDirectoryBuffer,
-		"FspFileSystemFillDirectoryBuffer":    &fillDirectoryBuffer,
-		"FspFileSystemCreate":                 &fileSystemCreate,
-		"FspFileSystemDelete":                 &fileSystemDelete,
-		"FspFileSystemSetMountPoint":          &setMountPoint,
-		"FspFileSystemStartDispatcher":        &startDispatcher,
-		"FspFileSystemStopDispatcher":         &stopDispatcher,
-	})
-}
-
-var (
+	winFSPDLL   *syscall.DLL
 	tryLoadOnce sync.Once
 	tryLoadErr  error
 )
 
-// tryLoadWinFSP attempts to load the WinFSP DLL, the work
+// LoadWinFSP attempts to load the WinFSP DLL, the work
 // is done once and error will be persistent.
-func tryLoadWinFSP() error {
+func LoadWinFSP() error {
 	tryLoadOnce.Do(func() {
-		tryLoadErr = initWinFSP()
+		winFSPDLL, tryLoadErr = loadWinFSPDLL()
+		if tryLoadErr != nil {
+			return
+		}
+
+		procs := map[string]**syscall.Proc{
+			"FspFileSystemDeleteDirectoryBuffer":  &deleteDirectoryBuffer,
+			"FspFileSystemAcquireDirectoryBuffer": &acquireDirectoryBuffer,
+			"FspFileSystemReleaseDirectoryBuffer": &releaseDirectoryBuffer,
+			"FspFileSystemReadDirectoryBuffer":    &readDirectoryBuffer,
+			"FspFileSystemFillDirectoryBuffer":    &fillDirectoryBuffer,
+			"FspFileSystemCreate":                 &fileSystemCreate,
+			"FspFileSystemDelete":                 &fileSystemDelete,
+			"FspFileSystemSetMountPoint":          &setMountPoint,
+			"FspFileSystemStartDispatcher":        &startDispatcher,
+			"FspFileSystemStopDispatcher":         &stopDispatcher,
+		}
+
+		for name, proc := range procs {
+			if *proc, tryLoadErr = winFSPDLL.FindProc(name); tryLoadErr != nil {
+				tryLoadErr = errors.Wrapf(tryLoadErr, "winfsp cannot find proc %q", name)
+				return
+			}
+		}
 	})
 	return tryLoadErr
 }

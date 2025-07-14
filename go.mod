@@ -1,11 +1,11 @@
-module github.com/aegistudio/go-winfsp
+module github.com/Sirherobrine23/go-winfsp
 
-go 1.17
+go 1.24
 
 require (
 	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.8.1
-	golang.org/x/sys v0.3.0
+	golang.org/x/sys v0.34.0
 )
 
 require (

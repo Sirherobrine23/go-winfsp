@@ -17,7 +17,7 @@ import (
 
 // pool for integers in the path locker.
 var pool = &sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(uintptr)
 	},
 }
