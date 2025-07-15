@@ -30,15 +30,38 @@ type File interface {
 	Truncate(size int64) error
 }
 
-type FileSystem interface {
-	OpenFile(name string, flag int, perm os.FileMode) (File, error)
+type FileSystem[F File] interface {
+	OpenFile(name string, flag int, perm os.FileMode) (F, error)
 	Mkdir(name string, perm os.FileMode) error
 	Stat(name string) (os.FileInfo, error)
 	Rename(source, target string) error
 	Remove(name string) error
 }
 
-type fileHandle struct {
+var (
+	_ winfsp.BehaviourRename            = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourCreate            = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourGetSecurityByName = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourBase              = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourOverwrite         = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourReadDirectory     = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourGetFileInfo       = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourGetSecurity       = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourGetVolumeInfo     = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourSetVolumeLabel    = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourSetBasicInfo      = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourSetFileSize       = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourRead              = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourWrite             = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourFlush             = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourCanDelete         = (*fileSystem[File])(nil)
+	_ winfsp.BehaviourCleanup           = (*fileSystem[File])(nil)
+)
+
+// Return new FileSystem
+func New[F File](fs FileSystem[F]) winfsp.BehaviourBase { return &fileSystem[F]{inner: fs} }
+
+type fileHandle[F File] struct {
 	lock  *pathlock.Lock
 	dir   winfsp.DirBuffer
 	file  File
@@ -48,8 +71,8 @@ type fileHandle struct {
 	evaluatedIndex uint64
 }
 
-type fileSystem struct {
-	inner   FileSystem
+type fileSystem[F File] struct {
+	inner   FileSystem[F]
 	handles sync.Map
 	locker  pathlock.PathLocker
 
@@ -57,9 +80,8 @@ type fileSystem struct {
 	label    [32]uint16
 }
 
-func (handle *fileHandle) reopenFile(fs *fileSystem) (File, error) {
-	return fs.inner.OpenFile(
-		handle.lock.FilePath(), handle.flags, os.FileMode(0))
+func (handle *fileHandle[F]) reopenFile(fs *fileSystem[F]) (File, error) {
+	return fs.inner.OpenFile(handle.lock.FilePath(), handle.flags, os.FileMode(0))
 }
 
 func attributesFromFileMode(mode os.FileMode) uint32 {
@@ -76,10 +98,7 @@ func attributesFromFileMode(mode os.FileMode) uint32 {
 	return attributes
 }
 
-func (fs *fileSystem) GetSecurityByName(
-	ref *winfsp.FileSystemRef, name string,
-	flags winfsp.GetSecurityByNameFlags,
-) (uint32, *windows.SECURITY_DESCRIPTOR, error) {
+func (fs *fileSystem[F]) GetSecurityByName(ref *winfsp.FileSystemRef, name string, flags winfsp.GetSecurityByNameFlags) (uint32, *windows.SECURITY_DESCRIPTOR, error) {
 	info, err := fs.inner.Stat(name)
 	if err != nil || flags == winfsp.GetExistenceOnly {
 		return 0, nil, err
@@ -94,8 +113,6 @@ func (fs *fileSystem) GetSecurityByName(
 	}
 	return attributes, sd, err
 }
-
-var _ winfsp.BehaviourGetSecurityByName = (*fileSystem)(nil)
 
 func evaluateIndexNumber(p string) uint64 {
 	// XXX: we evaluate the index number for a file by hashing,
@@ -114,10 +131,7 @@ func evaluateIndexNumber(p string) uint64 {
 	return a ^ b ^ c ^ d
 }
 
-func fileInfoFromStat(
-	target *winfsp.FSP_FSCTL_FILE_INFO, source os.FileInfo,
-	evaluatedIndexNumber uint64,
-) {
+func fileInfoFromStat(target *winfsp.FSP_FSCTL_FILE_INFO, source os.FileInfo, evaluatedIndexNumber uint64) {
 	target.FileAttributes = attributesFromFileMode(source.Mode())
 	target.ReparseTag = 0
 	target.FileSize = uint64(source.Size())
@@ -170,11 +184,7 @@ const (
 		windows.FILE_NON_DIRECTORY_FILE
 )
 
-func (fs *fileSystem) openFile(
-	ref *winfsp.FileSystemRef, name string,
-	createOptions, grantedAccess uint32, mode os.FileMode,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) (uintptr, error) {
+func (fs *fileSystem[F]) openFile(_ *winfsp.FileSystemRef, name string, createOptions, grantedAccess uint32, mode os.FileMode, info *winfsp.FSP_FSCTL_FILE_INFO) (uintptr, error) {
 	if createOptions&unsupportedCreateOptions != 0 {
 		return 0, windows.STATUS_INVALID_PARAMETER
 	}
@@ -247,9 +257,7 @@ func (fs *fileSystem) openFile(
 	}()
 
 	// Attempt to allocate the file handle.
-	handle := &fileHandle{
-		lock: lock,
-	}
+	handle := &fileHandle[F]{lock: lock}
 	handleAddr := uintptr(unsafe.Pointer(handle))
 	_, loaded := fs.handles.LoadOrStore(handleAddr, handle)
 	if loaded {
@@ -365,12 +373,7 @@ func (fs *fileSystem) openFile(
 	return handleAddr, nil
 }
 
-func (fs *fileSystem) Create(
-	ref *winfsp.FileSystemRef, name string,
-	createOptions, grantedAccess, fileAttributes uint32,
-	securityDescriptor *windows.SECURITY_DESCRIPTOR,
-	allocationSize uint64, info *winfsp.FSP_FSCTL_FILE_INFO,
-) (uintptr, error) {
+func (fs *fileSystem[F]) Create(ref *winfsp.FileSystemRef, name string, createOptions, grantedAccess, fileAttributes uint32, securityDescriptor *windows.SECURITY_DESCRIPTOR, allocationSize uint64, info *winfsp.FSP_FSCTL_FILE_INFO) (uintptr, error) {
 	fileMode := os.FileMode(0444)
 	if fileAttributes&windows.FILE_ATTRIBUTE_READONLY == 0 {
 		fileMode |= os.FileMode(0666)
@@ -378,41 +381,27 @@ func (fs *fileSystem) Create(
 	if fileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
 		fileMode |= os.FileMode(0111)
 	}
-	return fs.openFile(
-		ref, name, createOptions, grantedAccess,
-		fileMode, info,
-	)
+	return fs.openFile(ref, name, createOptions, grantedAccess, fileMode, info)
 }
 
-var _ winfsp.BehaviourCreate = (*fileSystem)(nil)
-
-func (fs *fileSystem) Open(
-	ref *winfsp.FileSystemRef, name string,
-	createOptions, grantedAccess uint32,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) (uintptr, error) {
-	return fs.openFile(
-		ref, name, createOptions, grantedAccess,
-		os.FileMode(0), info,
-	)
+func (fs *fileSystem[F]) Open(ref *winfsp.FileSystemRef, name string, createOptions, grantedAccess uint32, info *winfsp.FSP_FSCTL_FILE_INFO) (uintptr, error) {
+	return fs.openFile(ref, name, createOptions, grantedAccess, os.FileMode(0), info)
 }
 
-func (fs *fileSystem) load(file uintptr) (*fileHandle, error) {
+func (fs *fileSystem[F]) load(file uintptr) (*fileHandle[F], error) {
 	obj, ok := fs.handles.Load(file)
 	if !ok {
 		return nil, windows.STATUS_INVALID_HANDLE
 	}
-	return obj.(*fileHandle), nil
+	return obj.(*fileHandle[F]), nil
 }
 
-func (fs *fileSystem) Close(
-	ref *winfsp.FileSystemRef, file uintptr,
-) {
+func (fs *fileSystem[F]) Close(ref *winfsp.FileSystemRef, file uintptr) {
 	object, ok := fs.handles.LoadAndDelete(file)
 	if !ok {
 		return
 	}
-	fileHandle := object.(*fileHandle)
+	fileHandle := object.(*fileHandle[F])
 	fileHandle.mtx.Lock()
 	defer fileHandle.mtx.Unlock()
 	defer fileHandle.lock.Unlock()
@@ -423,7 +412,7 @@ func (fs *fileSystem) Close(
 	}
 }
 
-func (handle *fileHandle) lockChecked() error {
+func (handle *fileHandle[_]) lockChecked() error {
 	handle.mtx.RLock()
 	valid := false
 	defer func() {
@@ -438,18 +427,11 @@ func (handle *fileHandle) lockChecked() error {
 	return nil
 }
 
-func (handle *fileHandle) unlockChecked() {
+func (handle *fileHandle[_]) unlockChecked() {
 	handle.mtx.RUnlock()
 }
 
-var _ winfsp.BehaviourBase = (*fileSystem)(nil)
-
-func (fs *fileSystem) Overwrite(
-	ref *winfsp.FileSystemRef, file uintptr,
-	attributes uint32, replaceAttributes bool,
-	allocationSize uint64,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) error {
+func (fs *fileSystem[F]) Overwrite(ref *winfsp.FileSystemRef, file uintptr, attributes uint32, replaceAttributes bool, allocationSize uint64, info *winfsp.FSP_FSCTL_FILE_INFO) error {
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -473,11 +455,7 @@ func (fs *fileSystem) Overwrite(
 	return nil
 }
 
-var _ winfsp.BehaviourOverwrite = (*fileSystem)(nil)
-
-func (fs *fileSystem) GetOrNewDirBuffer(
-	ref *winfsp.FileSystemRef, file uintptr,
-) (*winfsp.DirBuffer, error) {
+func (fs *fileSystem[F]) GetOrNewDirBuffer(ref *winfsp.FileSystemRef, file uintptr) (*winfsp.DirBuffer, error) {
 	fileHandle, err := fs.load(file)
 	if err != nil {
 		return nil, err
@@ -485,10 +463,7 @@ func (fs *fileSystem) GetOrNewDirBuffer(
 	return &fileHandle.dir, nil
 }
 
-func (fs *fileSystem) ReadDirectory(
-	ref *winfsp.FileSystemRef, file uintptr, pattern string,
-	fill func(string, *winfsp.FSP_FSCTL_FILE_INFO) (bool, error),
-) error {
+func (fs *fileSystem[F]) ReadDirectory(ref *winfsp.FileSystemRef, file uintptr, pattern string, fill func(string, *winfsp.FSP_FSCTL_FILE_INFO) (bool, error)) error {
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -517,12 +492,7 @@ func (fs *fileSystem) ReadDirectory(
 	return nil
 }
 
-var _ winfsp.BehaviourReadDirectory = (*fileSystem)(nil)
-
-func (fs *fileSystem) GetFileInfo(
-	ref *winfsp.FileSystemRef, file uintptr,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) error {
+func (fs *fileSystem[F]) GetFileInfo(ref *winfsp.FileSystemRef, file uintptr, info *winfsp.FSP_FSCTL_FILE_INFO) error {
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -539,11 +509,7 @@ func (fs *fileSystem) GetFileInfo(
 	return nil
 }
 
-var _ winfsp.BehaviourGetFileInfo = (*fileSystem)(nil)
-
-func (fs *fileSystem) GetSecurity(
-	ref *winfsp.FileSystemRef, file uintptr,
-) (*windows.SECURITY_DESCRIPTOR, error) {
+func (fs *fileSystem[F]) GetSecurity(ref *winfsp.FileSystemRef, file uintptr) (*windows.SECURITY_DESCRIPTOR, error) {
 	_, err := fs.load(file)
 	if err != nil {
 		return nil, err
@@ -551,11 +517,7 @@ func (fs *fileSystem) GetSecurity(
 	return procsd.Load()
 }
 
-var _ winfsp.BehaviourGetSecurity = (*fileSystem)(nil)
-
-func (fs *fileSystem) GetVolumeInfo(
-	ref *winfsp.FileSystemRef, info *winfsp.FSP_FSCTL_VOLUME_INFO,
-) error {
+func (fs *fileSystem[F]) GetVolumeInfo(ref *winfsp.FileSystemRef, info *winfsp.FSP_FSCTL_VOLUME_INFO) error {
 	// TODO: support file system remaining size query.
 	info.TotalSize = 8 * 1024 * 1024 * 1024 * 1024 // 8TB
 	info.FreeSize = info.TotalSize
@@ -565,12 +527,7 @@ func (fs *fileSystem) GetVolumeInfo(
 	return nil
 }
 
-var _ winfsp.BehaviourGetVolumeInfo = (*fileSystem)(nil)
-
-func (fs *fileSystem) SetVolumeLabel(
-	ref *winfsp.FileSystemRef, label string,
-	info *winfsp.FSP_FSCTL_VOLUME_INFO,
-) error {
+func (fs *fileSystem[F]) SetVolumeLabel(ref *winfsp.FileSystemRef, label string, info *winfsp.FSP_FSCTL_VOLUME_INFO) error {
 	utf16, err := windows.UTF16FromString(label)
 	if err != nil {
 		return err
@@ -579,14 +536,7 @@ func (fs *fileSystem) SetVolumeLabel(
 	return fs.GetVolumeInfo(ref, info)
 }
 
-var _ winfsp.BehaviourSetVolumeLabel = (*fileSystem)(nil)
-
-func (fs *fileSystem) SetBasicInfo(
-	ref *winfsp.FileSystemRef, file uintptr,
-	flags winfsp.SetBasicInfoFlags, attribute uint32,
-	creationTime, lastAccessTime, lastWriteTime, changeTime uint64,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) error {
+func (fs *fileSystem[F]) SetBasicInfo(ref *winfsp.FileSystemRef, file uintptr, flags winfsp.SetBasicInfoFlags, attribute uint32, creationTime, lastAccessTime, lastWriteTime, changeTime uint64, info *winfsp.FSP_FSCTL_FILE_INFO) error {
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -602,8 +552,6 @@ func (fs *fileSystem) SetBasicInfo(
 	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
 	return windows.STATUS_ACCESS_DENIED
 }
-
-var _ winfsp.BehaviourSetBasicInfo = (*fileSystem)(nil)
 
 // FileTruncateEx is the truncate interface related to Windows
 // style opertations. Without this interface, we will be
@@ -632,11 +580,7 @@ func (f *fileMimicTruncate) Shrink(newSize int64) error {
 	return nil
 }
 
-func (fs *fileSystem) SetFileSize(
-	ref *winfsp.FileSystemRef, file uintptr,
-	newSize uint64, setAllocationSize bool,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) error {
+func (fs *fileSystem[F]) SetFileSize(ref *winfsp.FileSystemRef, file uintptr, newSize uint64, setAllocationSize bool, info *winfsp.FSP_FSCTL_FILE_INFO) error {
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -671,12 +615,7 @@ func (fs *fileSystem) SetFileSize(
 	return nil
 }
 
-var _ winfsp.BehaviourSetFileSize = (*fileSystem)(nil)
-
-func (fs *fileSystem) Read(
-	ref *winfsp.FileSystemRef, file uintptr,
-	buf []byte, offset uint64,
-) (int, error) {
+func (fs *fileSystem[F]) Read(ref *winfsp.FileSystemRef, file uintptr, buf []byte, offset uint64) (int, error) {
 	handle, err := fs.load(file)
 	if err != nil {
 		return 0, err
@@ -689,8 +628,6 @@ func (fs *fileSystem) Read(
 	// on windows should support random read.
 	return handle.file.ReadAt(buf, int64(offset))
 }
-
-var _ winfsp.BehaviourRead = (*fileSystem)(nil)
 
 // FileWriteEx is the write interface related to Windows style
 // writing. Without this interface, we will be imitating the
@@ -731,9 +668,7 @@ func (f *fileMimicWrite) Append(b []byte) (int, error) {
 	}
 }
 
-func (f *fileMimicWrite) ConstrainedWriteAt(
-	b []byte, offset int64,
-) (int, error) {
+func (f *fileMimicWrite) ConstrainedWriteAt(b []byte, offset int64) (int, error) {
 	// BUG: this is also a buggy part when two
 	// concurrent write operation happens. You
 	// might expect the reordering of constrained
@@ -752,12 +687,7 @@ func (f *fileMimicWrite) ConstrainedWriteAt(
 	return f.WriteAt(b, offset)
 }
 
-func (fs *fileSystem) Write(
-	ref *winfsp.FileSystemRef, file uintptr,
-	b []byte, offset uint64,
-	writeToEndOfFile, constrainedIo bool,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) (int, error) {
+func (fs *fileSystem[F]) Write(ref *winfsp.FileSystemRef, file uintptr, b []byte, offset uint64, writeToEndOfFile, constrainedIo bool, info *winfsp.FSP_FSCTL_FILE_INFO) (int, error) {
 	handle, err := fs.load(file)
 	if err != nil {
 		return 0, err
@@ -802,12 +732,7 @@ func (fs *fileSystem) Write(
 	return n, err
 }
 
-var _ winfsp.BehaviourWrite = (*fileSystem)(nil)
-
-func (fs *fileSystem) Flush(
-	ref *winfsp.FileSystemRef, file uintptr,
-	info *winfsp.FSP_FSCTL_FILE_INFO,
-) error {
+func (fs *fileSystem[F]) Flush(ref *winfsp.FileSystemRef, file uintptr, info *winfsp.FSP_FSCTL_FILE_INFO) error {
 	if file == 0 {
 		// Flush the whole filesystem, not a single file.
 		return nil
@@ -831,12 +756,7 @@ func (fs *fileSystem) Flush(
 	return nil
 }
 
-var _ winfsp.BehaviourFlush = (*fileSystem)(nil)
-
-func (fs *fileSystem) CanDelete(
-	ref *winfsp.FileSystemRef, file uintptr,
-	name string,
-) error {
+func (fs *fileSystem[F]) CanDelete(ref *winfsp.FileSystemRef, file uintptr, name string) error {
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -870,12 +790,7 @@ func (fs *fileSystem) CanDelete(
 	return nil
 }
 
-var _ winfsp.BehaviourCanDelete = (*fileSystem)(nil)
-
-func (fs *fileSystem) Cleanup(
-	ref *winfsp.FileSystemRef, file uintptr,
-	name string, cleanupFlags uint32,
-) {
+func (fs *fileSystem[F]) Cleanup(ref *winfsp.FileSystemRef, file uintptr, name string, cleanupFlags uint32) {
 	handle, err := fs.load(file)
 	if err != nil {
 		return
@@ -896,12 +811,7 @@ func (fs *fileSystem) Cleanup(
 	_ = fs.inner.Remove(handle.lock.FilePath())
 }
 
-var _ winfsp.BehaviourCleanup = (*fileSystem)(nil)
-
-func (fs *fileSystem) Rename(
-	ref *winfsp.FileSystemRef, file uintptr,
-	source, target string, replaceIfExist bool,
-) error {
+func (fs *fileSystem[F]) Rename(ref *winfsp.FileSystemRef, file uintptr, source, target string, replaceIfExist bool) error {
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -980,12 +890,4 @@ func (fs *fileSystem) Rename(
 	}
 	handle.lock, newLock = newLock, handle.lock
 	return nil
-}
-
-var _ winfsp.BehaviourRename = (*fileSystem)(nil)
-
-func New(fs FileSystem) winfsp.BehaviourBase {
-	return &fileSystem{
-		inner: fs,
-	}
 }

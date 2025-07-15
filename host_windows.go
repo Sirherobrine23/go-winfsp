@@ -14,6 +14,117 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const (
+	fspNetDeviceName  = "WinFSP.Net"
+	fspDiskDeviceName = "WinFSP.Disk"
+)
+
+var (
+	fileSystemCreate *syscall.Proc
+	fileSystemDelete *syscall.Proc
+	setMountPoint    *syscall.Proc
+	startDispatcher  *syscall.Proc
+	stopDispatcher   *syscall.Proc
+
+	winFSPDLL   *syscall.DLL
+	tryLoadOnce sync.Once
+	tryLoadErr  error
+)
+
+// Preload DLL on start module and ignore error
+func init() { _ = LoadWinFSP() }
+
+// LoadWinFSP attempts to load the WinFSP DLL, the work
+// is done once and error will be persistent.
+func LoadWinFSP() error {
+	tryLoadOnce.Do(func() {
+		// loadWinFSPDLL attempts to locate and load the DLL, the library handle will be available from now on.
+		var dllName string
+		switch runtime.GOARCH {
+		case "amd64":
+			dllName = "winfsp-x64.dll"
+		case "arm64":
+			dllName = "winfsp-a64.dll"
+		case "386":
+			dllName = "winfsp-x86.dll"
+		default:
+			// Current platform does not have winfsp shipped with it, and we can only report the error.
+			tryLoadErr = errors.Errorf("winfsp unsupported arch %q", runtime.GOARCH)
+			return
+		}
+
+		// Ateemp load with only dll name
+		if winFSPDLL, tryLoadErr = syscall.LoadDLL(dllName); winFSPDLL == nil {
+			// Well, we must lookup the registry to find our winFSP installation now.
+			findInstallError := func(err error) error { return errors.Wrapf(err, "winfsp find installation") }
+
+			// Get Register key
+			var keyReg syscall.Handle // HKLM\\Software\\WinFSP
+			if keyName, err := syscall.UTF16PtrFromString("Software\\WinFsp"); err != nil {
+				tryLoadErr = findInstallError(err)
+				return
+			} else if err = syscall.RegOpenKeyEx(syscall.HKEY_LOCAL_MACHINE, keyName, 0, syscall.KEY_READ|syscall.KEY_WOW64_32KEY, &keyReg); err != nil {
+				tryLoadErr = findInstallError(err)
+				return
+			}
+			defer syscall.RegCloseKey(keyReg)
+
+			// Get InstallDir from Key
+			valueName, err := syscall.UTF16PtrFromString("InstallDir")
+			if err != nil {
+				tryLoadErr = findInstallError(err)
+				return
+			}
+
+			var pathBuf [syscall.MAX_PATH]uint16
+			var valueType, valueSize uint32
+			valueSize = uint32(len(pathBuf)) * SIZEOF_WCHAR
+			if err := syscall.RegQueryValueEx(keyReg, valueName, nil, &valueType, (*byte)(unsafe.Pointer(&pathBuf)), &valueSize); err != nil {
+				tryLoadErr = findInstallError(err)
+				return
+			} else if valueType != syscall.REG_SZ {
+				tryLoadErr = findInstallError(syscall.ERROR_MOD_NOT_FOUND)
+				return
+			}
+
+			// Convert to string path
+			path := pathBuf[:int(valueSize/SIZEOF_WCHAR)]
+			if len(path) > 0 && path[len(path)-1] == 0 {
+				path = path[:len(path)-1]
+			}
+			installPath := syscall.UTF16ToString(path)
+
+			// Attempt to load the DLL that we have found.
+			if winFSPDLL, tryLoadErr = syscall.LoadDLL(filepath.Join(installPath, "bin", dllName)); tryLoadErr != nil {
+				return
+			}
+		}
+		runtime.KeepAlive(winFSPDLL) // Keep DLL opened
+
+		// Load procs to variables
+		procs := map[string]**syscall.Proc{
+			"FspFileSystemDeleteDirectoryBuffer":  &deleteDirectoryBuffer,
+			"FspFileSystemAcquireDirectoryBuffer": &acquireDirectoryBuffer,
+			"FspFileSystemReleaseDirectoryBuffer": &releaseDirectoryBuffer,
+			"FspFileSystemReadDirectoryBuffer":    &readDirectoryBuffer,
+			"FspFileSystemFillDirectoryBuffer":    &fillDirectoryBuffer,
+			"FspFileSystemCreate":                 &fileSystemCreate,
+			"FspFileSystemDelete":                 &fileSystemDelete,
+			"FspFileSystemSetMountPoint":          &setMountPoint,
+			"FspFileSystemStartDispatcher":        &startDispatcher,
+			"FspFileSystemStopDispatcher":         &stopDispatcher,
+		}
+		for name, proc := range procs {
+			if *proc, tryLoadErr = winFSPDLL.FindProc(name); tryLoadErr != nil {
+				tryLoadErr = errors.Wrapf(tryLoadErr, "winfsp cannot find proc %q", name)
+				return
+			}
+			runtime.KeepAlive(*proc) // Don't GC collect
+		}
+	})
+	return tryLoadErr
+}
+
 // FileSystemRef is the reference for the file system,
 // with which the callers can operate and manipulate the
 // file system, except for destroying it.
@@ -963,19 +1074,6 @@ func Options(opts ...Option) Option {
 	}
 }
 
-const (
-	fspNetDeviceName  = "WinFSP.Net"
-	fspDiskDeviceName = "WinFSP.Disk"
-)
-
-var (
-	fileSystemCreate *syscall.Proc
-	fileSystemDelete *syscall.Proc
-	setMountPoint    *syscall.Proc
-	startDispatcher  *syscall.Proc
-	stopDispatcher   *syscall.Proc
-)
-
 // Mount attempts to mount a file system to specified mount
 // point, returning the handle to the real filesystem.
 func Mount(fs BehaviourBase, mountpoint string, opts ...Option) (*FileSystem, error) {
@@ -1208,107 +1306,4 @@ func (f *FileSystem) Unmount() {
 	fileSystem := uintptr(unsafe.Pointer(f.fileSystem))
 	_, _, _ = stopDispatcher.Call(fileSystem)
 	_, _, _ = fileSystemDelete.Call(fileSystem)
-}
-
-// loadWinFSPDLL attempts to locate and load the DLL, the
-// library handle will be available from now on.
-func loadWinFSPDLL() (*syscall.DLL, error) {
-	var dllName string
-	switch runtime.GOARCH {
-	case "amd64":
-		dllName = "winfsp-x64.dll"
-	case "arm64":
-		dllName = "winfsp-a64.dll"
-	case "386":
-		dllName = "winfsp-x86.dll"
-	default:
-		// Current platform does not have winfsp shipped
-		// with it, and we can only report the error.
-		return nil, errors.Errorf("winfsp unsupported arch %q", runtime.GOARCH)
-	}
-
-	dll, _ := syscall.LoadDLL(dllName)
-	if dll != nil {
-		return dll, nil
-	}
-
-	// Well, we must lookup the registry to find our
-	// winFSP installation now.
-	findInstallError := func(err error) error {
-		return errors.Wrapf(err, "winfsp find installation")
-	}
-	var keyReg syscall.Handle // HKLM\\Software\\WinFSP
-	keyName, err := syscall.UTF16PtrFromString("Software\\WinFsp")
-	if err != nil {
-		return nil, findInstallError(err)
-	}
-	if err := syscall.RegOpenKeyEx(
-		syscall.HKEY_LOCAL_MACHINE, keyName, 0,
-		syscall.KEY_READ|syscall.KEY_WOW64_32KEY, &keyReg,
-	); err != nil {
-		return nil, findInstallError(err)
-	}
-	defer syscall.RegCloseKey(keyReg)
-	valueName, err := syscall.UTF16PtrFromString("InstallDir")
-	if err != nil {
-		return nil, findInstallError(err)
-	}
-	var pathBuf [syscall.MAX_PATH]uint16
-	var valueType, valueSize uint32
-	valueSize = uint32(len(pathBuf)) * SIZEOF_WCHAR
-	if err := syscall.RegQueryValueEx(
-		keyReg, valueName, nil, &valueType,
-		(*byte)(unsafe.Pointer(&pathBuf)), &valueSize,
-	); err != nil {
-		return nil, findInstallError(err)
-	}
-	if valueType != syscall.REG_SZ {
-		return nil, findInstallError(syscall.ERROR_MOD_NOT_FOUND)
-	}
-	path := pathBuf[:int(valueSize/SIZEOF_WCHAR)]
-	if len(path) > 0 && path[len(path)-1] == 0 {
-		path = path[:len(path)-1]
-	}
-	installPath := syscall.UTF16ToString(path)
-
-	// Attempt to load the DLL that we have found.
-	return syscall.LoadDLL(filepath.Join(installPath, "bin", dllName))
-}
-
-var (
-	winFSPDLL   *syscall.DLL
-	tryLoadOnce sync.Once
-	tryLoadErr  error
-)
-
-// LoadWinFSP attempts to load the WinFSP DLL, the work
-// is done once and error will be persistent.
-func LoadWinFSP() error {
-	tryLoadOnce.Do(func() {
-		winFSPDLL, tryLoadErr = loadWinFSPDLL()
-		if tryLoadErr != nil {
-			return
-		}
-
-		procs := map[string]**syscall.Proc{
-			"FspFileSystemDeleteDirectoryBuffer":  &deleteDirectoryBuffer,
-			"FspFileSystemAcquireDirectoryBuffer": &acquireDirectoryBuffer,
-			"FspFileSystemReleaseDirectoryBuffer": &releaseDirectoryBuffer,
-			"FspFileSystemReadDirectoryBuffer":    &readDirectoryBuffer,
-			"FspFileSystemFillDirectoryBuffer":    &fillDirectoryBuffer,
-			"FspFileSystemCreate":                 &fileSystemCreate,
-			"FspFileSystemDelete":                 &fileSystemDelete,
-			"FspFileSystemSetMountPoint":          &setMountPoint,
-			"FspFileSystemStartDispatcher":        &startDispatcher,
-			"FspFileSystemStopDispatcher":         &stopDispatcher,
-		}
-
-		for name, proc := range procs {
-			if *proc, tryLoadErr = winFSPDLL.FindProc(name); tryLoadErr != nil {
-				tryLoadErr = errors.Wrapf(tryLoadErr, "winfsp cannot find proc %q", name)
-				return
-			}
-		}
-	})
-	return tryLoadErr
 }
